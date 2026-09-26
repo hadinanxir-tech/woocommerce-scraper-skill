@@ -1,0 +1,29 @@
+{
+  "name": "woocommerce-product-list-scraper",
+  "description": "List public products from a WooCommerce store URL and export them to a CSV file.",
+  "version": "1.0.0",
+  "author": "Copilot",
+  "entrypoint": "python scraper.py",
+  "input": {
+    "type": "object",
+    "properties": {
+      "store_url": {
+        "type": "string",
+        "description": "The public URL of the WooCommerce store, for example https://example.com"
+      },
+      "output_file": {
+        "type": "string",
+        "description": "The output CSV filename, for example products.csv"
+      }
+    },
+    "required": ["store_url"]
+  },
+  "output": {
+    "type": "string",
+    "description": "Path to the generated CSV file containing the discovered products."
+  },
+  "notes": [
+    "This tool works best with public product pages or public WooCommerce APIs.",
+    "Stores that require login or WooCommerce API credentials will need authentication to return the full product catalog."
+  ]
+}

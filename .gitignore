@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import json
+import re
+import sys
+from typing import Dict, Iterable, List, Optional, Set
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+
+
+def normalize_store_url(raw_url: str) -> str:
+    candidate = raw_url.strip()
+    if not candidate:
+        raise ValueError("Store URL is required")
+    if not candidate.startswith(("http://", "https://")):
+        candidate = "https://" + candidate
+    parsed = urlparse(candidate)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+
+
+def fetch(url: str, timeout: int = 20) -> requests.Response:
+    response = requests.get(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/json,application/xhtml+xml,*/*"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response
+
+
+def clean_text(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def text_from_html(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "lxml")
+    return clean_text(soup.get_text(separator=" ", strip=True))
+
+
+def extract_product_from_jsonld(html_text: str, url: str) -> Dict[str, str]:
+    product = {}
+    pattern = re.compile(r"<script[^>]*type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", re.I | re.S)
+    for match in pattern.finditer(html_text):
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            candidates = [data]
+        else:
+            candidates = []
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            item = candidate.get("itemListElement") if isinstance(candidate.get("itemListElement"), list) else []
+            if item:
+                for entry in item:
+                    if isinstance(entry, dict):
+                        entry_data = entry.get("item") or entry.get("result") or entry
+                        if isinstance(entry_data, dict) and entry_data.get("@type") == "Product":
+                            candidate = entry_data
+                            break
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("@type") == "Product" or "Product" in str(candidate.get("@type", "")):
+                product["name"] = str(candidate.get("name") or "")
+                product["url"] = str(candidate.get("url") or url)
+                product["description"] = str(candidate.get("description") or "")
+                product["image_url"] = ""
+                image = candidate.get("image")
+                if isinstance(image, dict):
+                    product["image_url"] = str(image.get("url") or image.get("contentUrl") or "")
+                elif isinstance(image, list):
+                    for entry in image:
+                        if isinstance(entry, dict):
+                            product["image_url"] = str(entry.get("url") or entry.get("contentUrl") or "")
+                            break
+                offers = candidate.get("offers")
+                if isinstance(offers, dict):
+                    product["price"] = str(offers.get("price") or "")
+                    product["currency"] = str(offers.get("priceCurrency") or "")
+                elif isinstance(offers, list):
+                    if offers:
+                        offer = offers[0]
+                        if isinstance(offer, dict):
+                            product["price"] = str(offer.get("price") or "")
+                            product["currency"] = str(offer.get("priceCurrency") or "")
+                return product
+    return {}
+
+
+def parse_product_page(product_url: str) -> Dict[str, str]:
+    page = fetch(product_url)
+    html_text = page.text
+    product = extract_product_from_jsonld(html_text, product_url)
+    if product:
+        return product
+
+    soup = BeautifulSoup(html_text, "lxml")
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    product["name"] = clean_text(title.replace("-", " ").replace("|", " "))
+    product["url"] = product_url
+    product["description"] = clean_text(soup.find("meta", attrs={"name": "description"}).get("content", "") if soup.find("meta", attrs={"name": "description"}) else "")
+    product["image_url"] = ""
+    og_image = soup.find("meta", property="og:image")
+    if og_image and og_image.get("content"):
+        product["image_url"] = og_image["content"]
+    price = ""
+    for selector in [".price", "span.woocommerce-Price-amount", "meta[itemprop='price']"]:
+        node = soup.select_one(selector)
+        if node:
+            price = clean_text(node.get_text(" ", strip=True))
+            break
+    product["price"] = re.sub(r"[^0-9.,]", "", price)
+    return product
+
+
+def find_product_links(base_url: str, max_pages: int = 10) -> Set[str]:
+    seen: Set[str] = set()
+    queue: List[str] = [base_url]
+    visited: Set[str] = set()
+
+    while queue and len(visited) < max_pages * 5:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        try:
+            page = fetch(current)
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(page.text, "lxml")
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            candidate = urljoin(current, href)
+            parsed = urlparse(candidate)
+            if not parsed.scheme or not parsed.netloc:
+                continue
+            if "/product/" in parsed.path or "/products/" in parsed.path or "product" in parsed.path:
+                if candidate not in seen:
+                    seen.add(candidate)
+                    queue.append(candidate)
+
+        for pattern in ["/shop", "/products", "/product-category", "/all-products"]:
+            if pattern in current:
+                continue
+
+        for page_url in [
+            base_url + "/shop",
+            base_url + "/products",
+            base_url + "/product-category/all",
+        ]:
+            if page_url not in visited and page_url not in queue:
+                queue.append(page_url)
+
+    return seen
+
+
+def collect_products_from_api(base_url: str) -> List[Dict[str, str]]:
+    candidates = [
+        f"{base_url}/wp-json/wc/store/products",
+        f"{base_url}/wp-json/wc/v3/products",
+        f"{base_url}/wp-json/wp/v2/product",
+        f"{base_url}/wp-json/wp/v2/product?per_page=100",
+    ]
+
+    all_products: List[Dict[str, str]] = []
+    for endpoint in candidates:
+        try:
+            response = fetch(endpoint)
+        except Exception:
+            continue
+
+        if response.headers.get("Content-Type", "").startswith("application/json") or response.text.strip().startswith("[") or response.text.strip().startswith("{"):
+            try:
+                payload = response.json()
+            except ValueError:
+                continue
+
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict):
+                        all_products.append({
+                            "id": str(item.get("id") or ""),
+                            "name": str(item.get("name") or ""),
+                            "slug": str(item.get("slug") or ""),
+                            "url": str(item.get("permalink") or item.get("link") or ""),
+                            "price": str(item.get("price") or item.get("regular_price") or ""),
+                            "regular_price": str(item.get("regular_price") or ""),
+                            "sale_price": str(item.get("sale_price") or ""),
+                            "stock_status": str(item.get("stock_status") or ""),
+                            "sku": str(item.get("sku") or ""),
+                            "categories": ", ".join([str(cat.get("name") or "") for cat in item.get("categories", []) if isinstance(cat, dict)]),
+                            "image_url": "",
+                            "short_description": clean_text(item.get("short_description")),
+                            "description": clean_text(item.get("description")),
+                        })
+            elif isinstance(payload, dict):
+                items = payload.get("products") or payload.get("items") or []
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            all_products.append({
+                                "id": str(item.get("id") or ""),
+                                "name": str(item.get("name") or ""),
+                                "slug": str(item.get("slug") or ""),
+                                "url": str(item.get("permalink") or item.get("link") or ""),
+                                "price": str(item.get("price") or item.get("regular_price") or ""),
+                                "regular_price": str(item.get("regular_price") or ""),
+                                "sale_price": str(item.get("sale_price") or ""),
+                                "stock_status": str(item.get("stock_status") or ""),
+                                "sku": str(item.get("sku") or ""),
+                                "categories": ", ".join([str(cat.get("name") or "") for cat in item.get("categories", []) if isinstance(cat, dict)]),
+                                "image_url": "",
+                                "short_description": clean_text(item.get("short_description")),
+                                "description": clean_text(item.get("description")),
+                            })
+
+    deduped: Dict[str, Dict[str, str]] = {}
+    for product in all_products:
+        key = product.get("url") or product.get("name") or product.get("id")
+        if key:
+            deduped[key] = product
+    return list(deduped.values())
+
+
+def collect_products_from_html(base_url: str) -> List[Dict[str, str]]:
+    discovered_urls = find_product_links(base_url)
+    products: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    for product_url in discovered_urls:
+        if product_url in seen:
+            continue
+        seen.add(product_url)
+        try:
+            product = parse_product_page(product_url)
+        except Exception:
+            continue
+        if not product.get("name"):
+            continue
+        row = {
+            "id": "",
+            "name": product.get("name", ""),
+            "slug": "",
+            "url": product.get("url", product_url),
+            "price": product.get("price", ""),
+            "regular_price": "",
+            "sale_price": "",
+            "stock_status": "",
+            "sku": "",
+            "categories": "",
+            "image_url": product.get("image_url", ""),
+            "short_description": "",
+            "description": product.get("description", ""),
+        }
+        products.append(row)
+
+    return products
+
+
+def export_csv(products: List[Dict[str, str]], output_file: str):
+    fieldnames = [
+        "id",
+        "name",
+        "slug",
+        "url",
+        "price",
+        "regular_price",
+        "sale_price",
+        "stock_status",
+        "sku",
+        "categories",
+        "image_url",
+        "short_description",
+        "description",
+    ]
+
+    with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for product in products:
+            writer.writerow({key: product.get(key, "") for key in fieldnames})
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scrape public WooCommerce products and export to CSV")
+    parser.add_argument("store_url", help="Public store URL like https://example.com")
+    parser.add_argument("--output", default="products.csv", help="CSV output file path")
+    parser.add_argument("--max-pages", type=int, default=10, help="Maximum number of HTML pages to inspect")
+    parser.add_argument("--verbose", action="store_true", help="Show verbose logs")
+    args = parser.parse_args()
+
+    try:
+        store_url = normalize_store_url(args.store_url)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        api_products = collect_products_from_api(store_url)
+        html_products = collect_products_from_html(store_url) if not api_products else []
+    except Exception as exc:
+        if args.verbose:
+            print(f"Scraping failed: {exc}", file=sys.stderr)
+        api_products = []
+        html_products = []
+
+    products = api_products + html_products
+    deduped: Dict[str, Dict[str, str]] = {}
+    for product in products:
+        key = product.get("url") or product.get("name") or product.get("id")
+        if key:
+            deduped[key] = product
+
+    export_csv(list(deduped.values()), args.output)
+    print(f"Exported {len(deduped)} products to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
